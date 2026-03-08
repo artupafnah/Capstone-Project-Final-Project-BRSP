@@ -1,0 +1,591 @@
+---
+title: "Analisis Ekspresi Gen Arabidopsis — Respons Stres Kekeringan"
+author: "OmicsLite Project"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    code_folding: show
+subtitle: 'Dataset GEO: GSE48474 | *Arabidopsis thaliana* Drought Stress'
+---
+```{r}
+library(clusterProfiler)
+library(org.At.tair.db)
+library(enrichplot)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 10,
+  fig.height = 7,
+  fig.align  = "center"
+)
+```
+
+# Pendahuluan
+
+Proyek ini menganalisis respons transkriptomik **Arabidopsis thaliana** terhadap **stres kekeringan (drought stress)** menggunakan data microarray dari NCBI GEO.
+
+| Parameter         | Detail |
+|-------------------|--------|
+| **GEO ID**        | [GSE48474](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE48474) |
+| **Organisme**     | *Arabidopsis thaliana* (Col-0) |
+| **Kondisi**       | Drought stress vs Control |
+| **Platform**      | Affymetrix ATH1 (22,810 probe sets) |
+| **Topik**         | Abiotic stress — water deficit response |
+
+**Tujuan:**
+
+1. Menemukan DEG antara **drought** vs **kontrol**
+2. Visualisasi dengan PCA, Volcano Plot, Heatmap
+3. Analisis fungsional via **GO (g:Profiler)** dan **KEGG Pathway**
+
+---
+
+# Instalasi Library
+
+```{r install, eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install(c(
+  "GEOquery", "limma", "clusterProfiler",
+  "org.At.tair.db", "AnnotationDbi"
+), ask = FALSE)
+
+install.packages(c(
+  "ggplot2", "pheatmap", "dplyr",
+  "RColorBrewer", "ggrepel", "enrichplot",
+  "stringr", "tidyr"
+))
+```
+
+---
+
+# Load Library & Persiapan Data
+
+```{r setup-all, cache=TRUE}
+# ── Library ───────────────────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(GEOquery);  library(limma);       library(ggplot2)
+  library(pheatmap);  library(dplyr);       library(RColorBrewer)
+  library(ggrepel);   library(stringr)
+})
+
+# ── Download GSE48474 ─────────────────────────────────────────────────────────
+options(timeout = 300)
+cat("Mengunduh GSE48474...\n")
+gse  <- getGEO("GSE48474", GSEMatrix = TRUE, getGPL = FALSE)
+eset <- gse[[1]]
+cat("Selesai! Sampel:", ncol(exprs(eset)),
+    "| Probe:", nrow(exprs(eset)), "\n")
+
+# ── Metadata ──────────────────────────────────────────────────────────────────
+meta <- pData(eset)
+
+# Tampilkan kolom untuk diagnostik
+cat("\nKolom characteristics:\n")
+char_cols <- grep("characteristics", colnames(meta), value = TRUE)
+for (col in char_cols) {
+  cat("→", col, ":", head(unique(as.character(meta[[col]])), 4), "\n")
+}
+
+# Ekstrak kondisi dari title sampel (lebih reliable untuk GSE48474)
+# Title format: "drought_rep1", "control_rep1", dll
+sample_info <- data.frame(
+  SampleID = rownames(meta),
+  Title    = as.character(meta$title),
+  stringsAsFactors = FALSE
+)
+
+# Deteksi kondisi dari title: "drought" atau "control"/"untreated"/"water"
+sample_info$Condition <- case_when(
+  str_detect(tolower(sample_info$Title), "drought|stressed|stress|dehydrat") ~ "Drought",
+  str_detect(tolower(sample_info$Title), "control|untreated|normal|water|well") ~ "Control",
+  TRUE ~ "Unknown"
+)
+
+cat("\n=== Distribusi Kondisi ===\n")
+print(table(sample_info$Condition))
+
+# Jika ada Unknown, coba dari characteristics_ch1
+if (any(sample_info$Condition == "Unknown")) {
+  cat("\nAda sampel Unknown, cek characteristics_ch1:\n")
+  print(head(as.character(meta$characteristics_ch1), 6))
+  
+  sample_info$Condition <- case_when(
+    str_detect(tolower(as.character(meta$characteristics_ch1)),
+               "drought|stress|dehydrat") ~ "Drought",
+    str_detect(tolower(as.character(meta$characteristics_ch1)),
+               "control|untreated|normal|water") ~ "Control",
+    TRUE ~ sample_info$Condition
+  )
+  cat("Setelah perbaikan:\n")
+  print(table(sample_info$Condition))
+}
+
+# ── Matriks ekspresi & log2 ───────────────────────────────────────────────────
+expr_mat <- exprs(eset)
+cat("\nRange ekspresi raw:", round(min(expr_mat), 2),
+    "hingga", round(max(expr_mat), 2), "\n")
+
+if (max(expr_mat, na.rm = TRUE) > 100) {
+  cat("Log2 transformasi...\n")
+  expr_mat <- log2(expr_mat + 1)
+}
+
+# ── Subset Drought vs Control ─────────────────────────────────────────────────
+drought_idx <- which(sample_info$Condition == "Drought")
+control_idx <- which(sample_info$Condition == "Control")
+
+cat("\nSampel Drought:", length(drought_idx))
+cat("\nSampel Control:", length(control_idx), "\n")
+
+# Validasi
+if (length(drought_idx) < 2) stop("Terlalu sedikit sampel Drought! Cek kolom Condition.")
+if (length(control_idx) < 2) stop("Terlalu sedikit sampel Control! Cek kolom Condition.")
+
+selected_idx  <- c(control_idx, drought_idx)
+expr_subset   <- expr_mat[, selected_idx]
+expr_subset   <- expr_subset[complete.cases(expr_subset), ]
+cond_labels   <- sample_info$Condition[selected_idx]
+
+cat("\nSemua data siap!\n")
+cat("Dimensi expr_subset:", dim(expr_subset), "\n")
+```
+
+---
+
+# Eksplorasi Data
+
+## Preview Metadata
+
+```{r preview-meta}
+knitr::kable(
+  head(sample_info, 8),
+  caption = "Tabel 1. Metadata Sampel GSE48474",
+  align   = "c"
+)
+```
+
+## Boxplot Distribusi Ekspresi
+
+```{r boxplot, fig.cap="Gambar 1. Distribusi ekspresi log2 seluruh sampel. Distribusi yang seragam menandakan normalisasi yang baik."}
+colors_box <- ifelse(sample_info$Condition == "Drought", "#E41A1C", "#377EB8")
+
+par(mar = c(10, 4, 4, 2))
+boxplot(
+  expr_mat,
+  las      = 2,
+  cex.axis = 0.5,
+  col      = colors_box,
+  main     = "Distribusi Ekspresi Log2 — Arabidopsis GSE48474",
+  ylab     = "Log2 Intensitas"
+)
+legend("topright",
+       legend = c("Drought", "Control"),
+       fill   = c("#E41A1C", "#377EB8"), bty = "n")
+```
+
+## PCA Plot
+
+```{r pca, fig.cap="Gambar 2. PCA plot. Pemisahan yang jelas antara Drought dan Control menandakan perbedaan ekspresi yang signifikan."}
+pca_res <- prcomp(t(expr_mat), scale. = TRUE)
+pca_df  <- data.frame(
+  PC1       = pca_res$x[, 1],
+  PC2       = pca_res$x[, 2],
+  Condition = sample_info$Condition
+)
+var_exp <- round(summary(pca_res)$importance[2, 1:2] * 100, 2)
+
+ggplot(pca_df, aes(PC1, PC2, color = Condition, shape = Condition)) +
+  geom_point(size = 5, alpha = 0.9) +
+  stat_ellipse(aes(group = Condition), linetype = "dashed", alpha = 0.4) +
+  scale_color_manual(values = c("Control" = "#377EB8", "Drought" = "#E41A1C")) +
+  scale_shape_manual(values = c("Control" = 16, "Drought" = 17)) +
+  labs(
+    title = "PCA — Arabidopsis thaliana: Drought vs Control",
+    subtitle = paste0("Dataset GSE48474 | ",
+                      sum(sample_info$Condition == "Drought"), " Drought, ",
+                      sum(sample_info$Condition == "Control"), " Control"),
+    x = paste0("PC1 (", var_exp[1], "%)"),
+    y = paste0("PC2 (", var_exp[2], "%)"),
+    color = "Kondisi", shape = "Kondisi"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "right")
+```
+
+---
+
+# Analisis DEG: Drought vs Control
+
+```{r deg}
+# Design matrix
+group  <- factor(cond_labels, levels = c("Control", "Drought"))
+design <- model.matrix(~0 + group)
+colnames(design) <- c("Control", "Drought")
+
+# Fit limma
+fit  <- lmFit(expr_subset, design)
+fit2 <- contrasts.fit(fit,
+         makeContrasts(Drought_vs_Control = Drought - Control,
+                       levels = design))
+fit2 <- eBayes(fit2)
+
+# Ambil semua hasil
+deg_results <- topTable(fit2, coef = "Drought_vs_Control",
+                        number = Inf, adjust = "BH")
+
+# Klasifikasi (threshold: |logFC| > 1, adj.p < 0.05)
+deg_results$Status <- "Not Significant"
+deg_results$Status[deg_results$logFC >  1 & deg_results$adj.P.Val < 0.05] <- "Upregulated"
+deg_results$Status[deg_results$logFC < -1 & deg_results$adj.P.Val < 0.05] <- "Downregulated"
+
+deg_sig <- deg_results[deg_results$Status != "Not Significant", ]
+
+cat("=== Hasil DEG: Drought vs Control ===\n")
+cat("Total DEG signifikan:", nrow(deg_sig), "\n")
+cat("Upregulated (Drought)  :", sum(deg_sig$logFC > 0), "\n")
+cat("Downregulated (Drought):", sum(deg_sig$logFC < 0), "\n")
+```
+
+```{r tabel-deg}
+knitr::kable(
+  head(deg_results[, c("logFC","AveExpr","P.Value","adj.P.Val","Status")], 15),
+  digits  = 4,
+  caption = "Tabel 2. Top 15 DEG: Drought vs Control (Arabidopsis)",
+  align   = "c"
+)
+```
+
+---
+
+# Visualisasi DEG
+
+## Volcano Plot
+
+```{r volcano, fig.cap="Gambar 3. Volcano Plot DEG Arabidopsis. Merah = upregulated saat drought, Biru = downregulated saat drought."}
+top20 <- head(arrange(deg_results, adj.P.Val), 20)
+
+ggplot(deg_results, aes(logFC, -log10(adj.P.Val), color = Status)) +
+  geom_point(alpha = 0.3, size = 1.2) +
+  geom_point(data = filter(deg_results, Status != "Not Significant"),
+             size = 1.8, alpha = 0.8) +
+  geom_text_repel(
+    data = top20,
+    aes(label = rownames(top20)),
+    size = 2.8, color = "black",
+    max.overlaps = 20, box.padding = 0.3
+  ) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c(
+    "Upregulated"     = "#E41A1C",
+    "Downregulated"   = "#377EB8",
+    "Not Significant" = "gray80"
+  )) +
+  annotate("text", x = max(deg_results$logFC) * 0.7, y = 0.5,
+           label = paste0("Up: ", sum(deg_results$Status=="Upregulated")),
+           color = "#E41A1C", size = 4) +
+  annotate("text", x = min(deg_results$logFC) * 0.7, y = 0.5,
+           label = paste0("Down: ", sum(deg_results$Status=="Downregulated")),
+           color = "#377EB8", size = 4) +
+  labs(
+    title    = "Volcano Plot: Drought vs Control",
+    subtitle = "Arabidopsis thaliana (GSE48474)",
+    x = "Log2 Fold Change (Drought/Control)",
+    y = "-Log10 Adjusted P-value",
+    color = "Status"
+  ) +
+  theme_bw(base_size = 13) + theme(legend.position = "top")
+```
+
+## Heatmap Top 50 DEG
+
+```{r heatmap, fig.height=13, fig.cap="Gambar 4. Heatmap ekspresi Top 50 DEG (z-score per gen). Merah = ekspresi tinggi, Biru = ekspresi rendah."}
+# Ambil top 50 DEG
+top50 <- deg_results %>%
+  filter(Status != "Not Significant") %>%
+  arrange(adj.P.Val) %>%
+  head(50)
+
+# Fallback jika < 10 gen signifikan
+if (nrow(top50) < 10) {
+  top50 <- deg_results %>% arrange(adj.P.Val) %>% head(50)
+}
+
+hm_mat    <- expr_subset[rownames(top50), ]
+hm_scaled <- t(scale(t(hm_mat)))
+hm_scaled <- hm_scaled[complete.cases(hm_scaled), ]
+
+col_ann   <- data.frame(Kondisi = cond_labels, row.names = colnames(hm_scaled))
+ann_color <- list(Kondisi = c("Control" = "#377EB8", "Drought" = "#E41A1C"))
+
+pheatmap(
+  hm_scaled,
+  annotation_col    = col_ann,
+  annotation_colors = ann_color,
+  show_colnames     = FALSE,
+  show_rownames     = TRUE,
+  fontsize_row      = 7.5,
+  cluster_rows      = nrow(hm_scaled) >= 2,
+  cluster_cols      = TRUE,
+  color  = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  main   = paste0("Heatmap Top ", nrow(hm_scaled),
+                  " DEG — Drought vs Control\nArabidopsis thaliana (GSE48474)"),
+  breaks = seq(-3, 3, length.out = 101)
+)
+```
+
+---
+
+# Ekspor & Persiapan GO/KEGG
+
+```{r ekspor}
+# Ekspor file
+deg_up   <- deg_sig %>% filter(logFC > 0) %>% arrange(adj.P.Val) %>% head(20)
+deg_down <- deg_sig %>% filter(logFC < 0) %>% arrange(adj.P.Val) %>% head(20)
+
+write.csv(deg_results, "DEG_Full_Drought_vs_Control.csv",      row.names = TRUE)
+write.csv(deg_sig,     "DEG_Significant_Drought_vs_Control.csv", row.names = TRUE)
+write.csv(deg_up,      "Top20_Upregulated_Drought.csv",         row.names = TRUE)
+write.csv(deg_down,    "Top20_Downregulated_Drought.csv",        row.names = TRUE)
+
+cat("File berhasil diekspor!\n\n")
+
+# Cetak daftar gen untuk GO/KEGG
+cat("=== Top 20 Gen UPREGULATED (drought) — copy untuk GO/KEGG ===\n")
+cat(paste(rownames(deg_up), collapse = "\n"), "\n")
+
+cat("\n=== Top 20 Gen DOWNREGULATED (drought) — copy untuk GO/KEGG ===\n")
+cat(paste(rownames(deg_down), collapse = "\n"), "\n")
+```
+
+```{r tabel-ekspor}
+knitr::kable(
+  deg_up[, c("logFC", "adj.P.Val", "Status")],
+  digits  = 4,
+  caption = "Tabel 3. Top 20 Gen Upregulated saat Drought",
+  align   = "c"
+)
+
+knitr::kable(
+  deg_down[, c("logFC", "adj.P.Val", "Status")],
+  digits  = 4,
+  caption = "Tabel 4. Top 20 Gen Downregulated saat Drought",
+  align   = "c"
+)
+```
+
+---
+
+# Analisis GO dengan clusterProfiler (Otomatis di R!)
+
+> Bagian ini melakukan **GO Enrichment langsung di R** — tidak perlu buka website!
+
+
+```{r go-analysis, fig.height=9, fig.cap="Gambar 5. GO Enrichment Analysis — Top 20 Biological Process yang diperkaya pada gen upregulated saat drought."}
+library(clusterProfiler)
+library(org.At.tair.db)
+library(enrichplot)
+
+# Ambil gen upregulated & bersihkan nama probe
+genes_up       <- rownames(deg_up)
+genes_up_clean <- str_replace(genes_up, "_[a-z]?_?at$", "")
+
+cat("Gen upregulated untuk GO analysis:\n")
+print(genes_up_clean)
+
+# GO Enrichment — Biological Process
+go_bp <- enrichGO(
+  gene          = genes_up_clean,
+  OrgDb         = org.At.tair.db,
+  keyType       = "TAIR",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+if (nrow(as.data.frame(go_bp)) > 0) {
+  dotplot(go_bp, showCategory = 20,
+          title = "GO Biological Process — Upregulated saat Drought\nArabidopsis thaliana (GSE48474)")
+} else {
+  cat("Tidak ada GO term signifikan. Coba perluas ke seluruh deg_sig.\n")
+  
+  # Fallback: gunakan semua gen DEG signifikan
+  all_deg_clean <- str_replace(rownames(deg_sig), "_[a-z]?_?at$", "")
+  go_bp <- enrichGO(
+    gene          = all_deg_clean,
+    OrgDb         = org.At.tair.db,
+    keyType       = "TAIR",
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    readable      = TRUE
+  )
+  if (nrow(as.data.frame(go_bp)) > 0) {
+    dotplot(go_bp, showCategory = 20,
+            title = "GO Biological Process — Semua DEG Signifikan")
+  } else {
+    cat("GO analysis tidak menghasilkan term signifikan.\n")
+    cat("Cek format gene ID dengan: head(rownames(deg_sig))\n")
+  }
+}
+```
+
+```{r go-down, fig.height=9, fig.cap="Gambar 6. GO Enrichment — gen downregulated saat drought."}
+library(clusterProfiler); library(org.At.tair.db); library(enrichplot)
+
+genes_down_clean <- str_replace(rownames(deg_down), "_[a-z]?_?at$", "")
+
+go_bp_down <- enrichGO(
+  gene          = genes_down_clean,
+  OrgDb         = org.At.tair.db,
+  keyType       = "TAIR",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+if (nrow(as.data.frame(go_bp_down)) > 0) {
+  dotplot(go_bp_down, showCategory = 20,
+          title = "GO Biological Process — Downregulated saat Drought\nArabidopsis thaliana (GSE48474)")
+} else {
+  cat("Tidak ada GO term signifikan untuk downregulated genes.\n")
+}
+```
+
+---
+
+# Analisis KEGG Pathway (Otomatis di R!)
+
+```{r kegg, fig.height=8, fig.cap="Gambar 7. KEGG Pathway Enrichment — jalur metabolik yang terpengaruh saat drought."}
+library(clusterProfiler); library(enrichplot)
+
+kegg_res <- enrichKEGG(
+  gene          = genes_up_clean,
+  organism      = "ath",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+if (!is.null(kegg_res) && nrow(as.data.frame(kegg_res)) > 0) {
+  print(dotplot(kegg_res, showCategory = 15,
+                title = "KEGG Pathway — Upregulated saat Drought\nArabidopsis thaliana (GSE48474)"))
+  print(barplot(kegg_res, showCategory = 15,
+                title = "KEGG Pathway — Top 15"))
+} else {
+  cat("Tidak ada KEGG pathway signifikan untuk upregulated genes.\n")
+  cat("Mencoba dengan semua DEG signifikan...\n")
+
+  all_deg_clean <- str_replace(rownames(deg_sig), "_[a-z]?_?at$", "")
+  kegg_res <- enrichKEGG(
+    gene          = all_deg_clean,
+    organism      = "ath",
+    pvalueCutoff  = 0.05,
+    pAdjustMethod = "BH"
+  )
+  if (!is.null(kegg_res) && nrow(as.data.frame(kegg_res)) > 0) {
+    print(dotplot(kegg_res, showCategory = 15,
+                  title = "KEGG Pathway — Semua DEG Signifikan"))
+  } else {
+    cat("Tidak ada KEGG pathway signifikan.\n")
+  }
+}
+```
+
+```{r kegg-tabel}
+if (requireNamespace("clusterProfiler", quietly = TRUE) &&
+    exists("kegg_res") && nrow(as.data.frame(kegg_res)) > 0) {
+  kegg_df <- as.data.frame(kegg_res)[, c("Description","GeneRatio","pvalue","p.adjust","geneID")]
+  kegg_df$geneID <- str_trunc(kegg_df$geneID, 60)  # potong agar rapi di tabel
+  knitr::kable(
+    head(kegg_df, 15),
+    digits  = 4,
+    caption = "Tabel 5. Top 15 KEGG Pathway — Upregulated saat Drought",
+    align   = "l"
+  )
+}
+```
+
+---
+
+# Ringkasan Hasil
+
+```{r ringkasan}
+knitr::kable(
+  data.frame(
+    Parameter = c(
+      "Dataset GEO", "Organisme", "Kondisi Perbandingan",
+      "Total Sampel", "Total Probe/Gen",
+      "DEG Signifikan Total",
+      "Upregulated (saat drought)",
+      "Downregulated (saat drought)"
+    ),
+    Nilai = c(
+      "GSE48474",
+      "Arabidopsis thaliana (Col-0)",
+      "Drought vs Control",
+      ncol(expr_subset),
+      nrow(expr_subset),
+      nrow(deg_sig),
+      sum(deg_sig$logFC > 0),
+      sum(deg_sig$logFC < 0)
+    )
+  ),
+  caption = "Tabel 6. Ringkasan Hasil Analisis",
+  align   = "l"
+)
+```
+
+## Interpretasi Biologis
+
+Gen yang **upregulated** saat drought pada Arabidopsis umumnya terlibat dalam:
+
+- **Respons ABA (Abscisic Acid)** — hormon utama respons kekeringan
+- **LEA proteins** (Late Embryogenesis Abundant) — proteksi sel dari dehidrasi
+- **RD29A/RD29B** — *Responsive to Desiccation*, marker klasik drought stress
+- **NCED3** — biosintesis ABA
+- **Stomatal closure genes** — menutup stomata untuk mengurangi kehilangan air
+
+Gen yang **downregulated** umumnya terlibat dalam:
+
+- **Fotosintesis** — ditekan saat tanaman mengalami water stress
+- **Pertumbuhan sel** — ditekan untuk menghemat energi
+- **Metabolisme primer** — dikurangi selama kondisi stress
+
+## Langkah Manual: GO & KEGG via Web (Alternatif)
+
+Jika analisis R di atas error karena package belum terinstall:
+
+**g:Profiler (GO):**
+
+1. Buka <https://biit.cs.ut.ee/gprofiler/gost>
+2. Pilih organisme: **Arabidopsis thaliana**
+3. Paste gen dari output chunk `ekspor` di atas
+4. Klik **Run query**
+5. Cari term: `response to water deprivation`, `ABA signaling`, `stomatal movement`
+
+**KEGG Mapper:**
+
+1. Buka <https://www.genome.jp/kegg/mapper/search.html>
+2. Organisme: **ath** (*Arabidopsis thaliana*)
+3. Paste daftar gen → Cari pathway seperti `Plant hormone signal transduction`, `Photosynthesis`
+
+---
